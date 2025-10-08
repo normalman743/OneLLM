@@ -11,7 +11,8 @@ from fairscale.nn.model_parallel import initialize as fs_init
 
 class MetaModel(nn.Module):
 
-    def __init__(self, llama_type, llama_config, llama_ckpt_dir=None, tokenizer_path=None):
+    def __init__(self, llama_type, llama_config, llama_ckpt_dir=None, tokenizer_path=None,
+                 capture_layers=False, output_dir=None):
         super().__init__()
 
         self.criterion = torch.nn.CrossEntropyLoss(ignore_index=0)
@@ -38,6 +39,19 @@ class MetaModel(nn.Module):
             else:
                 print(f'Checkpoint not found at {ckpt_path}')
         self.llma = model
+
+        # Initialize layer capture functionality
+        self.capture_layers = capture_layers
+        if self.capture_layers:
+            from ..util.layer_capture import LayerOutputCapture
+            self.layer_capture = LayerOutputCapture(
+                output_dir=output_dir or "./layer_outputs",
+                enabled=True
+            )
+            print(f"Layer capture enabled, saving to: {self.layer_capture.output_dir}")
+        else:
+            self.layer_capture = None
+
         for name, param in self.named_parameters():
             if param.requires_grad:
                print(f"Trainable param: {name}, {param.shape}, {param.dtype}")
@@ -45,7 +59,7 @@ class MetaModel(nn.Module):
         print(f"Parameter count : {count}")
 
     def forward(self, examples, labels, image=None, modal='image'):
-        output = self.llma(examples, image=image, modal=modal)
+        output = self.llma(examples, image=image, modal=modal, layer_capture=self.layer_capture)
         output = output[:, :-1, :]
         labels = labels[:, 1:]
 
@@ -173,3 +187,153 @@ class MetaModel(nn.Module):
 
     def get_image_words(self):
         return self.llma.image_words
+
+    def inference_image_only(self, sample_id: str, image, modal='image'):
+        """
+        Run inference with image only input and capture layer outputs.
+
+        Args:
+            sample_id: Unique identifier for this sample
+            image: Input image tensor
+            modal: Modality type ('image', 'video', etc.)
+
+        Returns:
+            dict: Captured layer outputs information
+        """
+        if not self.capture_layers:
+            raise ValueError("Layer capture must be enabled during model initialization")
+
+        # Set up sample for capture
+        self.layer_capture.set_sample(
+            sample_id=sample_id,
+            metadata={
+                "input_type": "image_only",
+                "modal": modal,
+                "model_type": "onellm"
+            }
+        )
+
+        # Create dummy text (empty caption)
+        dummy_text = ""
+        prompt_tokens = [self.tokenizer.encode(dummy_text, bos=True, eos=False)]
+
+        # Create tensor with just BOS token
+        tokens = torch.full((1, 1), self.tokenizer.bos_id, dtype=torch.long).cuda()
+
+        # Run forward pass with image
+        with torch.no_grad():
+            try:
+                # Use the transformer directly for image-only processing
+                h = self.llma.tok_embeddings(tokens)
+                h_bos = h[:, :1]
+
+                # Process image
+                image_tokens = self.llma.encode_image(image, modal=modal, layer_capture=self.layer_capture)
+
+                # Combine: BOS + start_tag + image_tokens + end_tag
+                h_combined = torch.cat((
+                    h_bos,
+                    self.llma.start_tag[modal].expand(1, -1, -1),
+                    image_tokens,
+                    self.llma.end_tag[modal].expand(1, -1, -1)
+                ), dim=1)
+
+                # Run through LLaMA layers
+                self.llma.freqs_cis = self.llma.freqs_cis.to(h_combined.device)
+                seqlen = h_combined.shape[1]
+                freqs_cis = self.llma.freqs_cis[0:seqlen]
+                mask = torch.full((1, 1, seqlen, seqlen), float("-inf"), device=h_combined.device)
+                mask = torch.triu(mask, diagonal=1).type_as(h_combined)
+
+                # Capture all LLaMA layers
+                for i, layer in enumerate(self.llma.layers):
+                    h_combined = layer(h_combined, 0, freqs_cis, mask)
+
+                    if self.layer_capture.enabled:
+                        self.layer_capture.capture_layer(
+                            f"llama_layer_{i+1:02d}",
+                            h_combined,
+                            additional_info={
+                                "layer_number": i + 1,
+                                "layer_type": "transformer_block",
+                                "input_type": "image_only",
+                                "sequence_length": h_combined.shape[1],
+                                "feature_dim": h_combined.shape[2]
+                            }
+                        )
+
+                # Finish capture
+                self.layer_capture.finish_sample()
+
+                return {
+                    "status": "success",
+                    "sample_id": sample_id,
+                    "sequence_length": seqlen,
+                    "layers_captured": 32 + 1  # pre_llama + 32 llama layers
+                }
+
+            except Exception as e:
+                self.layer_capture.finish_sample()
+                return {
+                    "status": "error",
+                    "sample_id": sample_id,
+                    "error": str(e)
+                }
+
+    def inference_text_only(self, sample_id: str, text):
+        """
+        Run inference with text only input and capture layer outputs.
+
+        Args:
+            sample_id: Unique identifier for this sample
+            text: Input text string
+
+        Returns:
+            dict: Captured layer outputs information
+        """
+        if not self.capture_layers:
+            raise ValueError("Layer capture must be enabled during model initialization")
+
+        # Set up sample for capture
+        self.layer_capture.set_sample(
+            sample_id=sample_id,
+            metadata={
+                "input_type": "text_only",
+                "text": text,
+                "model_type": "onellm"
+            }
+        )
+
+        # Tokenize text
+        prompt_tokens = [self.tokenizer.encode(text, bos=True, eos=False)]
+        max_len = max(len(t) for t in prompt_tokens)
+
+        # Create tensor
+        tokens = torch.full((1, max_len), self.tokenizer.pad_id, dtype=torch.long).cuda()
+        for k, t in enumerate(prompt_tokens):
+            tokens[k, :len(t)] = torch.tensor(t).long()
+
+        # Run forward pass
+        with torch.no_grad():
+            try:
+                # Use the transformer directly for text-only processing
+                output = self.llma(tokens, image=None, modal=['image'], layer_capture=self.layer_capture)
+
+                # Finish capture
+                self.layer_capture.finish_sample()
+
+                return {
+                    "status": "success",
+                    "sample_id": sample_id,
+                    "sequence_length": max_len,
+                    "text": text,
+                    "layers_captured": 1 + 32  # embedding + 32 llama layers
+                }
+
+            except Exception as e:
+                self.layer_capture.finish_sample()
+                return {
+                    "status": "error",
+                    "sample_id": sample_id,
+                    "error": str(e)
+                }
