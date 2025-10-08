@@ -361,7 +361,7 @@ class Transformer(nn.Module):
 
         return x
 
-    def encode_image(self, x, modal='image'):
+    def encode_image(self, x, modal='image', layer_capture=None):
         bsz = x.size(0)
         T = 1
         if modal in ['image']:
@@ -416,20 +416,47 @@ class Transformer(nn.Module):
         image_feats = sum(image_feats_experts)
         image_feats = self.clip_proj2[modal](image_feats)
 
+        # CAPTURE POINT 1: Save output after all image processing (before LLaMA)
+        if layer_capture is not None and layer_capture.enabled:
+            layer_capture.capture_layer(
+                "pre_llama_image_features",
+                image_feats,
+                additional_info={
+                    "modal": modal,
+                    "batch_size": bsz,
+                    "sequence_length": image_feats.shape[1],
+                    "feature_dim": image_feats.shape[2]
+                }
+            )
+
         return image_feats
 
-    def forward(self, examples, image=None, modal='image'):
+    def forward(self, examples, image=None, modal='image', layer_capture=None):
         self._destroy_kv_cache()  # training always disables kv cache
         modal = modal[0]
         _bsz, seqlen = examples.shape
         h = self.tok_embeddings(examples)
+
+        # CAPTURE: Capture text embedding (for text-only inputs)
+        if layer_capture is not None and layer_capture.enabled and image is None:
+            layer_capture.capture_layer(
+                "text_embedding",
+                h,
+                additional_info={
+                    "input_type": "text_only",
+                    "batch_size": _bsz,
+                    "sequence_length": seqlen,
+                    "feature_dim": h.shape[2]
+                }
+            )
+
         self.freqs_cis = self.freqs_cis.to(h.device)
 
         start_pos = 0
         prefix_len = 0
         if image is not None:
             h_bos, h_caption = h[:, :1], h[:, 1:]
-            image_tokens = self.encode_image(image, modal)
+            image_tokens = self.encode_image(image, modal, layer_capture=layer_capture)
             h = torch.cat((h_bos, self.start_tag[modal].expand(
                 _bsz, -1, -1), image_tokens, self.end_tag[modal].expand(_bsz, -1, -1), h_caption), dim=1)
             # bos + image token + start_tag[modal], end_tag[modal] is used for caption generation
@@ -439,8 +466,26 @@ class Transformer(nn.Module):
         freqs_cis = self.freqs_cis[start_pos:start_pos + seqlen]
         mask = torch.full((1, 1, seqlen, seqlen), float("-inf"), device=h.device)
         mask = torch.triu(mask, diagonal=start_pos + 1).type_as(h)
-        for layer in self.layers:
+
+        # CAPTURE POINT 2: Capture all 32 LLaMA layers
+        for i, layer in enumerate(self.layers):
             h = layer(h, start_pos, freqs_cis, mask)
+
+            # Capture layer output
+            if layer_capture is not None and layer_capture.enabled:
+                layer_capture.capture_layer(
+                    f"llama_layer_{i+1:02d}",
+                    h,
+                    additional_info={
+                        "layer_number": i + 1,
+                        "layer_type": "transformer_block",
+                        "input_type": "multimodal" if image is not None else "text_only",
+                        "batch_size": _bsz,
+                        "sequence_length": h.shape[1],
+                        "feature_dim": h.shape[2]
+                    }
+                )
+
         h = self.norm(h)
         output = self.output(h[:, prefix_len:, :])
         return output
